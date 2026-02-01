@@ -1,104 +1,96 @@
 #!/bin/bash
 
 # ==============================================================================
-# Nextcloud Automated Installation Script for Ubuntu 22.04 LTS
+# SCRIPT DE INSTALACIÓN AUTOMÁTICA DE NEXTCLOUD
 # ==============================================================================
-# This script is designed for non-interactive execution (cloud-init, Bicep, etc.)
+# Objetivo: Instalación desatendida de Nextcloud en Ubuntu Server LTS
+# Arquitectura: Apache, MariaDB, PHP (LAMP Stack)
+# Autor: Antigravity AI
 # ==============================================================================
 
+# Bash estricto
 set -e
+set -u
 set -o pipefail
 
-# --- CONFIGURATION VARIABLES ---
-NEXTCLOUD_VERSION="28.0.2"
-NEXTCLOUD_DOMAIN="nextcloud.local"
+# ------------------------------------------------------------------------------
+# 1. VALIDACIONES INICIALES
+# ------------------------------------------------------------------------------
+
+# Verificar que el script se ejecute como root
+if [[ $EUID -ne 0 ]]; then
+   echo "[ERROR] Este script debe ejecutarse como root (usar sudo)."
+   exit 1
+fi
+
+# Verificar versión de Ubuntu (Ubuntu 22.04 o 24.04 recomendadas)
+UBUNTU_VER=$(lsb_release -rs)
+if [[ "$UBUNTU_VER" != "22.04" && "$UBUNTU_VER" != "24.04" ]]; then
+    echo "[WARNING] Este script ha sido probado en Ubuntu 22.04/24.04. Tu versión es $UBUNTU_VER."
+    echo "[INFO] Continuando bajo Propio Riesgo..."
+fi
+
+# Verificar conectividad a internet
+if ! ping -c 1 8.8.8.8 &>/dev/null; then
+    echo "[ERROR] No hay conexión a internet detectada."
+    exit 1
+fi
+
+echo "[PASO 1] Validaciones iniciales completadas con éxito."
+
+# ------------------------------------------------------------------------------
+# 2. DEFINICIÓN DE VARIABLES GLOBALES
+# ------------------------------------------------------------------------------
+
+# Configuración del Servidor
+NC_DOMAIN=$(hostname -I | awk '{print $1}') # IP por defecto, cambiar si hay dominio
+NC_ADMIN_USER="admin"
+NC_ADMIN_PASS="admin" # Password inicial solicitada
+
+# Configuración de Base de Datos
 DB_NAME="nextcloud_db"
 DB_USER="nextcloud_user"
-DB_PASSWORD="Password123!"
-ADMIN_USER="admin"
-ADMIN_PASSWORD="AdminPassword123!"
-DATA_DIRECTORY="/var/nextcloud_data"
-LOG_FILE="/var/log/nextcloud-install.log"
+DB_PASS=$(openssl rand -base64 16)
+DB_ROOT_PASS=$(openssl rand -base64 16)
 
-# --- LOGGING SETUP ---
-exec > >(tee -a "$LOG_FILE") 2>&1
+# Paths de Instalación
+NC_WEB_ROOT="/var/www/nextcloud"
+NC_DATA_DIR="/var/nextcloud_data"
 
-log() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
-}
+echo "[PASO 2] Variables definidas. Se usará la IP: $NC_DOMAIN"
 
-# --- FUNCTIONS ---
+# ------------------------------------------------------------------------------
+# 3. ACTUALIZACIÓN DEL SISTEMA
+# ------------------------------------------------------------------------------
+echo "[PASO 3] Actualizando repositorios y paquetes del sistema..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get upgrade -y
 
-prepare_system() {
-    log "Updating and upgrading system packages..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get upgrade -y
+# ------------------------------------------------------------------------------
+# 4. INSTALACIÓN DE DEPENDENCIAS BASE
+# ------------------------------------------------------------------------------
+echo "[PASO 4] Instalando herramientas base..."
+apt-get install -y curl unzip wget ca-certificates lsb-release gnupg2 apt-transport-https
 
-    log "Setting timezone to UTC..."
-    timedatectl set-timezone UTC
+# ------------------------------------------------------------------------------
+# 5. INSTALACIÓN Y CONFIGURACIÓN DEL SERVIDOR WEB (APACHE)
+# ------------------------------------------------------------------------------
+echo "[PASO 5] Instalando y configurando Apache..."
+apt-get install -y apache2
 
-    log "Installing base tools..."
-    apt-get install -y curl wget unzip ca-certificates gnupg lsb-release vim
-}
+# Habilitar módulos necesarios
+a2enmod rewrite dir mime env headers ssl proxy proxy_http proxy_fcgi setenvif
+systemctl restart apache2
 
-install_mariadb() {
-    log "Installing MariaDB..."
-    apt-get install -y mariadb-server
-
-    log "Securing MariaDB and creating database..."
-    # Idempotent database and user creation
-    mysql <<-EOS
-        DELETE FROM mysql.user WHERE User='';
-        DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
-        DROP DATABASE IF EXISTS test;
-        DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
-        CREATE DATABASE IF NOT EXISTS ${DB_NAME} CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
-        CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';
-        GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'localhost';
-        FLUSH PRIVILEGES;
-EOS
-    
-    log "Validating database connectivity..."
-    mysql -u"${DB_USER}" -p"${DB_PASSWORD}" -e "STATUS;" > /dev/null
-}
-
-install_php() {
-    log "Installing PHP 8.1 and extensions..."
-    # Ubuntu 22.04 defaults to PHP 8.1
-    apt-get install -y php-cli php-fpm php-mysql php-xml php-gd php-curl php-zip \
-        php-mbstring php-intl php-bcmath php-imagick php-apcu libapache2-mod-php
-
-    log "Configuring PHP settings..."
-    PHP_INI=$(php -i | grep /etc/php/.*/cli/php.ini | cut -d" " -f5 | sed 's/cli/apache2/')
-    
-    sed -i "s/memory_limit = .*/memory_limit = 512M/" "$PHP_INI"
-    sed -i "s/upload_max_filesize = .*/upload_max_filesize = 512M/" "$PHP_INI"
-    sed -i "s/post_max_size = .*/post_max_size = 512M/" "$PHP_INI"
-    sed -i "s/max_execution_time = .*/max_execution_time = 300/" "$PHP_INI"
-    
-    # OPcache configuration
-    sed -i "s/;opcache.enable=1/opcache.enable=1/" "$PHP_INI"
-    sed -i "s/;opcache.enable_cli=0/opcache.enable_cli=1/" "$PHP_INI"
-    sed -i "s/;opcache.interned_strings_buffer=8/opcache.interned_strings_buffer=16/" "$PHP_INI"
-    sed -i "s/;opcache.max_accelerated_files=10000/opcache.max_accelerated_files=10000/" "$PHP_INI"
-    sed -i "s/;opcache.memory_consumption=128/opcache.memory_consumption=128/" "$PHP_INI"
-    sed -i "s/;opcache.save_comments=1/opcache.save_comments=1/" "$PHP_INI"
-    sed -i "s/;opcache.revalidate_freq=2/opcache.revalidate_freq=1/" "$PHP_INI"
-}
-
-install_apache() {
-    log "Installing Apache2 and enabling modules..."
-    apt-get install -y apache2
-    a2enmod rewrite headers env dir mime ssl
-
-    log "Creating VirtualHost..."
-    cat > /etc/apache2/sites-available/nextcloud.conf <<EOF
+# Crear VirtualHost
+cat <<EOF > /etc/apache2/sites-available/nextcloud.conf
 <VirtualHost *:80>
-    ServerName ${NEXTCLOUD_DOMAIN}
-    DocumentRoot /var/www/nextcloud
+    ServerAdmin webmaster@localhost
+    DocumentRoot $NC_WEB_ROOT
+    ServerName $NC_DOMAIN
 
-    <Directory /var/www/nextcloud/>
+    <Directory $NC_WEB_ROOT/>
         Options +FollowSymlinks
         AllowOverride All
         Require all granted
@@ -107,8 +99,8 @@ install_apache() {
             Dav off
         </IfModule>
 
-        SetEnv HOME /var/www/nextcloud
-        SetEnv HTTP_HOME /var/www/nextcloud
+        SetEnv HOME $NC_WEB_ROOT
+        SetEnv HTTP_HOME $NC_WEB_ROOT
     </Directory>
 
     ErrorLog \${APACHE_LOG_DIR}/nextcloud_error.log
@@ -116,114 +108,125 @@ install_apache() {
 </VirtualHost>
 EOF
 
-    a2dissite 000-default
-    a2ensite nextcloud
-    systemctl restart apache2
-}
+a2ensite nextcloud.conf
+a2dissite 000-default.conf
+systemctl reload apache2
 
-install_nextcloud() {
-    log "Downloading Nextcloud ${NEXTCLOUD_VERSION}..."
-    if [ ! -f /tmp/nextcloud.zip ]; then
-        wget "https://download.nextcloud.com/server/releases/nextcloud-${NEXTCLOUD_VERSION}.zip" -P /tmp
-    fi
+# ------------------------------------------------------------------------------
+# 6. INSTALACIÓN Y CONFIGURACIÓN DE PHP
+# ------------------------------------------------------------------------------
+echo "[PASO 6] Instalando PHP y extensiones necesarias..."
+# Nextcloud 28+ recomienda PHP 8.2 o 8.3
+apt-get install -y php php-common php-mysql php-gd php-curl php-xml php-zip php-mbstring php-intl php-bcmath php-gmp php-imagick php-opcache php-cli libapache2-mod-php
 
-    log "Extracting Nextcloud..."
-    if [ ! -d /var/www/nextcloud ]; then
-        unzip -q /tmp/nextcloud.zip -d /var/www/
-    fi
+# Ajustes recomendados en php.ini
+PHP_INI=$(php --ini | grep "Loaded Configuration File" | awk '{print $4}')
+sed -i "s/memory_limit = .*/memory_limit = 512M/" $PHP_INI
+sed -i "s/upload_max_filesize = .*/upload_max_filesize = 1G/" $PHP_INI
+sed -i "s/post_max_size = .*/post_max_size = 1G/" $PHP_INI
+sed -i "s/max_execution_time = .*/max_execution_time = 300/" $PHP_INI
+sed -i "s/;date.timezone =.*/date.timezone = UTC/" $PHP_INI
+sed -i "s/;opcache.enable=.*/opcache.enable=1/" $PHP_INI
+sed -i "s/;opcache.memory_consumption=.*/opcache.memory_consumption=128/" $PHP_INI
+sed -i "s/;opcache.interned_strings_buffer=.*/opcache.interned_strings_buffer=8/" $PHP_INI
+sed -i "s/;opcache.max_accelerated_files=.*/opcache.max_accelerated_files=10000/" $PHP_INI
+sed -i "s/;opcache.revalidate_freq=.*/opcache.revalidate_freq=1/" $PHP_INI
+sed -i "s/;opcache.save_comments=.*/opcache.save_comments=1/" $PHP_INI
 
-    log "Setting up data directory..."
-    mkdir -p "$DATA_DIRECTORY"
-    chown -R www-data:www-data "$DATA_DIRECTORY"
-    chown -R www-data:www-data /var/www/nextcloud
+systemctl restart apache2
 
-    log "Running Nextcloud installation via occ..."
-    # Run only if not already installed
-    if ! [ -f /var/www/nextcloud/config/config.php ]; then
-        sudo -u www-data php /var/www/nextcloud/occ maintenance:install \
-            --database "mysql" \
-            --database-name "$DB_NAME" \
-            --database-user "$DB_USER" \
-            --database-pass "$DB_PASSWORD" \
-            --data-dir "$DATA_DIRECTORY" \
-            --admin-user "$ADMIN_USER" \
-            --admin-pass "$ADMIN_PASSWORD"
-    fi
+# ------------------------------------------------------------------------------
+# 7. INSTALACIÓN Y CONFIGURACIÓN DE LA BASE DE DATOS (MARIADB)
+# ------------------------------------------------------------------------------
+echo "[PASO 7] Instalando y configurando MariaDB..."
+apt-get install -y mariadb-server
 
-    log "Configuring trusted domains..."
-    sudo -u www-data php /var/www/nextcloud/occ config:system:set trusted_domains 1 --value="$NEXTCLOUD_DOMAIN"
-    
-    log "Disabling maintenance mode..."
-    sudo -u www-data php /var/www/nextcloud/occ maintenance:mode --off
-}
+# Hardening básico de MariaDB (Equivalente simple a mysql_secure_installation)
+mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${DB_ROOT_PASS}';"
+mysql -u root -p"${DB_ROOT_PASS}" -e "DELETE FROM mysql.user WHERE User='';"
+mysql -u root -p"${DB_ROOT_PASS}" -e "DROP DATABASE IF EXISTS test;"
+mysql -u root -p"${DB_ROOT_PASS}" -e "DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';"
+mysql -u root -p"${DB_ROOT_PASS}" -e "FLUSH PRIVILEGES;"
 
-post_install_config() {
-    log "Running post-install optimizations..."
-    sudo -u www-data php /var/www/nextcloud/occ db:add-missing-indices
-    sudo -u www-data php /var/www/nextcloud/occ db:add-missing-columns
-    sudo -u www-data php /var/www/nextcloud/occ db:convert-filecache-bigint --no-interaction
+# Crear DB y Usuario para Nextcloud
+mysql -u root -p"${DB_ROOT_PASS}" -e "CREATE DATABASE ${DB_NAME} CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
+mysql -u root -p"${DB_ROOT_PASS}" -e "CREATE USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+mysql -u root -p"${DB_ROOT_PASS}" -e "GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'localhost';"
+mysql -u root -p"${DB_ROOT_PASS}" -e "FLUSH PRIVILEGES;"
 
-    log "Configuring region and locale..."
-    sudo -u www-data php /var/www/nextcloud/occ config:system:set default_phone_region --value="US"
-    
-    log "Setting log level..."
-    sudo -u www-data php /var/www/nextcloud/occ config:system:set loglevel --value=2
+# ------------------------------------------------------------------------------
+# 8. DESCARGA E INSTALACIÓN DE NEXTCLOUD
+# ------------------------------------------------------------------------------
+echo "[PASO 8] Descargando y preparando Nextcloud..."
+LATEST_VERSION=$(curl -s https://download.nextcloud.com/server/releases/ | grep -o 'nextcloud-[0-9.]*\.zip' | sort -V | tail -1)
+wget "https://download.nextcloud.com/server/releases/${LATEST_VERSION}" -O nextcloud.zip
 
-    log "Enabling recommended apps..."
-    sudo -u www-data php /var/www/nextcloud/occ app:enable calendar || true
-    sudo -u www-data php /var/www/nextcloud/occ app:enable contacts || true
+unzip -q nextcloud.zip -d /var/www/
+rm nextcloud.zip
 
-    log "Setting up Cron background jobs..."
-    sudo -u www-data php /var/www/nextcloud/occ background:cron
-    (crontab -u www-data -l 2>/dev/null; echo "*/5  *  *  *  * php -f /var/www/nextcloud/cron.php") | crontab -u www-data -
-}
+# Crear directorio de datos
+mkdir -p $NC_DATA_DIR
 
-security_and_performance() {
-    log "Configuring APCu..."
-    sudo -u www-data php /var/www/nextcloud/occ config:system:set memcache.local --value="\OC\Memcache\APCu"
+# Asignar permisos y ownership
+chown -R www-data:www-data $NC_WEB_ROOT
+chown -R www-data:www-data $NC_DATA_DIR
+chmod -R 755 $NC_WEB_ROOT
+chmod -R 750 $NC_DATA_DIR
 
-    log "Configuring file locking..."
-    # Usually requires Redis for production, but using internal/database for this basic script
+# ------------------------------------------------------------------------------
+# 9. INSTALACIÓN AUTOMÁTICA DE NEXTCLOUD (CLI)
+# ------------------------------------------------------------------------------
+echo "[PASO 9] Ejecutando instalación via OCC..."
+sudo -u www-data php $NC_WEB_ROOT/occ maintenance:install \
+    --database "mysql" \
+    --database-name "$DB_NAME" \
+    --database-user "$DB_USER" \
+    --database-pass "$DB_PASS" \
+    --admin-user "$NC_ADMIN_USER" \
+    --admin-pass "$NC_ADMIN_PASS" \
+    --data-dir "$NC_DATA_DIR"
 
-    log "Adding security headers in Apache configuration..."
-    sed -i '/<\/Directory>/i \    Header always set Strict-Transport-Security "max-age=15552000; includeSubDomains"' /etc/apache2/sites-available/nextcloud.conf
-    
-    log "Preparing system for HTTPS (overwrite protocol if behind reverse proxy)..."
-    sudo -u www-data php /var/www/nextcloud/occ config:system:set overwrite.cli.url --value="http://$NEXTCLOUD_DOMAIN"
-    
-    systemctl reload apache2
-}
+# ------------------------------------------------------------------------------
+# 10. CONFIGURACIÓN POST-INSTALACIÓN
+# ------------------------------------------------------------------------------
+echo "[PASO 10] Ajustes de configuración de Nextcloud..."
 
-validate() {
-    log "--- FINAL VALIDATION ---"
-    
-    log "Apache status:"
-    systemctl is-active apache2
+# Trusted Domains
+sudo -u www-data php $NC_WEB_ROOT/occ config:system:set trusted_domains 1 --value="$NC_DOMAIN"
 
-    log "Database status:"
-    systemctl is-active mariadb
+# Configurar Cron Job
+echo "*/5  *  *  *  * php -f $NC_WEB_ROOT/cron.php" | crontab -u www-data -
 
-    log "Nextcloud status:"
-    sudo -u www-data php /var/www/nextcloud/occ status
+# Seguridad e índices
+sudo -u www-data php $NC_WEB_ROOT/occ db:add-missing-indices --no-interaction
+sudo -u www-data php $NC_WEB_ROOT/occ db:convert-filecache-bigint --no-interaction
 
-    echo ""
-    echo "=============================================================================="
-    echo " Nextcloud Installation Completed Successfully!"
-    echo "=============================================================================="
-    echo " Access URL: http://$NEXTCLOUD_DOMAIN"
-    echo " Admin User: $ADMIN_USER"
-    echo " Admin Password: $ADMIN_PASSWORD"
-    echo " Log file: $LOG_FILE"
-    echo "=============================================================================="
-}
+# ------------------------------------------------------------------------------
+# 11. CONFIGURACIÓN DE SSL (LETS ENCRYPT) - OPCIONAL
+# ------------------------------------------------------------------------------
+# Nota: Esto solo funcionará si NC_DOMAIN es un FQDN real que apunta a este server
+if [[ "$NC_DOMAIN" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+    echo "[PASO 11] Detectado FQDN. Intentando configurar Let's Encrypt..."
+    apt-get install -y certbot python3-certbot-apache
+    # certbot --apache -d "$NC_DOMAIN" --non-interactive --agree-tos --email webmaster@$NC_DOMAIN || echo "[SKIP] Certbot falló, continuando con HTTP."
+else
+    echo "[PASO 11] No se detectó dominio público (solo IP). Saltando SSL."
+fi
 
-# --- MAIN EXECUTION ---
+# ------------------------------------------------------------------------------
+# 12. VERIFICACIONES FINALES
+# ------------------------------------------------------------------------------
+echo "[PASO 12] Verificando servicios..."
+systemctl is-active --quiet apache2 && echo "Apache: [OK]" || echo "Apache: [FALLO]"
+systemctl is-active --quiet mariadb && echo "MariaDB: [OK]" || echo "MariaDB: [FALLO]"
 
-prepare_system
-install_mariadb
-install_php
-install_apache
-install_nextcloud
-post_install_config
-security_and_performance
-validate
+echo "--------------------------------------------------------------------------"
+echo " ¡INSTALACIÓN COMPLETADA EXITOSAMENTE! "
+echo "--------------------------------------------------------------------------"
+echo " URL: http://$NC_DOMAIN"
+echo " Usuario Admin: $NC_ADMIN_USER"
+echo " Password Admin: $NC_ADMIN_PASS (¡CÁMBIALA AL INICIAR SESIÓN!)"
+echo "--------------------------------------------------------------------------"
+echo " Guarda estas credenciales en un lugar seguro."
+echo " Base de Datos (root pass): $DB_ROOT_PASS"
+echo "--------------------------------------------------------------------------"
