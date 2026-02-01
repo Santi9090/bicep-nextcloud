@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.40.2.10011",
-      "templateHash": "14557615511108701489"
+      "templateHash": "16060610859871712047"
     }
   },
   "parameters": {
@@ -41,6 +41,13 @@
       "type": "securestring",
       "metadata": {
         "description": "Password for the Administrator user."
+      }
+    },
+    "scriptRepoUrl": {
+      "type": "string",
+      "defaultValue": "https://raw.githubusercontent.com/Santi9090/bicep-nextcloud/main",
+      "metadata": {
+        "description": "URL of the GitHub repository containing the installation script."
       }
     }
   },
@@ -157,7 +164,7 @@
           "computerName": "[parameters('virtualMachineName')]",
           "adminUsername": "[parameters('adminUsername')]",
           "adminPassword": "[parameters('adminPassword')]",
-          "customData": "[base64('#!/bin/bash\r\n      # Descargar y ejecutar script desde GitHub\r\n      curl -sL https://raw.githubusercontent.com/Santi9090/bicep-nextcloud/main/install-nextcloud.sh | sudo bash\r\n      ')]",
+          "customData": "[base64(format('#!/bin/bash\n# Descargar y ejecutar script desde GitHub\ncurl -sL {0}/install-nextcloud.sh | sudo bash', parameters('scriptRepoUrl')))]",
           "linuxConfiguration": {
             "disablePasswordAuthentication": false
           }
